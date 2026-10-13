@@ -50,43 +50,6 @@ Enable **⋯ → Start minimized to tray** to apply that behavior on the next la
 
 If the tray cannot be created, the app opens its main window.
 
-## Settings and logs
-
-Files are stored in `%LOCALAPPDATA%\MSFS-SimRateMonitor`:
-
-- `settings.json`: startup preference, overlay size and position.
-- `msfs_mini_gui.log`: connection and command log, rotated at 1 MB.
-
-You can start the app before MSFS. It retries the connection when the simulator is unavailable and reconnects after a restart.
-
-If speed controls do nothing, check that a flight is active. MSFS can restrict rate changes in some states. When reporting a problem, include the MSFS version, aircraft and log file.
-
-## Run from source
-
-Use 64-bit Python 3.12 on Windows:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe mini_gui.py
-```
-
-## Build
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\build.bat
-.\.venv\Scripts\python.exe tools\package_release.py
-```
-
-Outputs in `dist`:
-
-- `MSFS-SimRate-Monitor.exe`
-- `MSFS-SimRate-Monitor-windows-x64.zip`
-- `SHA256SUMS.txt`
-
-GitHub Actions builds the Windows executable on pushes to `master`, pull requests and manual runs. Each successful build uploads the files above as an artifact. Pushing a tag beginning with `v` also publishes a release, using `.github/release-notes.md` for its description.
-
 ## License
 
 MIT, retaining the original project's copyright notice. Dependency licenses are included in the release ZIP.
