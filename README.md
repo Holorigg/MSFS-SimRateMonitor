@@ -85,17 +85,7 @@ Outputs in `dist`:
 - `MSFS-SimRate-Monitor-windows-x64.zip`
 - `SHA256SUMS.txt`
 
-GitHub Actions tests and builds the Windows executable on pushes to `master`, pull requests and manual runs. Each successful build uploads the files above as an artifact. Pushing a tag beginning with `v` also publishes a release, using `.github/release-notes.md` for its description.
-
-## Tests
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe tests\smoke_gui.py
-.\.venv\Scripts\python.exe tests\smoke_exe.py
-```
-
-The unit tests use a simulated SimConnect connection. The two smoke tests require a Windows desktop and exercise the window, overlay, tray and packaged executable. They do not change a running simulator's speed. Testing in an actual MSFS flight is separate.
+GitHub Actions builds the Windows executable on pushes to `master`, pull requests and manual runs. Each successful build uploads the files above as an artifact. Pushing a tag beginning with `v` also publishes a release, using `.github/release-notes.md` for its description.
 
 ## License
 
