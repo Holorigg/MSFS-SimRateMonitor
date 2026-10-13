@@ -75,9 +75,7 @@ class SimConnect:
 	def handle_state_event(self, pData):
 		print("I:", pData.dwInteger, "F:", pData.fFloat, "S:", pData.szString)
 
-	# TODO: update callbackfunction to expand functions.
 	def my_dispatch_proc(self, pData, cbData, pContext):
-		# print("my_dispatch_proc")
 		dwID = pData.contents.dwID
 		if dwID == SIMCONNECT_RECV_ID.SIMCONNECT_RECV_ID_EVENT:
 			evt = cast(pData, POINTER(SIMCONNECT_RECV_EVENT)).contents
@@ -148,6 +146,8 @@ class SimConnect:
 			err = self.dll.Open(
 				byref(self.hSimConnect), LPCSTR(b"Request Data"), None, 0, 0, 0
 			)
+			if not self.IsHR(err, 0):
+				raise ConnectionError("Did not find Flight Simulator running.")
 			if self.IsHR(err, 0):
 				LOGGER.debug("Connected to Flight Simulator!")
 				# Request an event when the simulation starts
@@ -175,8 +175,12 @@ class SimConnect:
 				self.timerThread = threading.Thread(target=self._run)
 				self.timerThread.daemon = True
 				self.timerThread.start()
+				deadline = time.monotonic() + 5.0
 				while self.ok is False:
-					pass
+					if self.quit or time.monotonic() >= deadline:
+						self.exit()
+						raise ConnectionError("SimConnect connection timed out.")
+					time.sleep(.01)
 		except OSError:
 			LOGGER.debug("Did not find Flight Simulator running.")
 			raise ConnectionError("Did not find Flight Simulator running.")
@@ -191,8 +195,13 @@ class SimConnect:
 
 	def exit(self):
 		self.quit = 1
-		self.timerThread.join()
-		self.dll.Close(self.hSimConnect)
+		thread = getattr(self, 'timerThread', None)
+		if thread is not None and thread is not threading.current_thread():
+			thread.join(timeout=2.0)
+		if self.hSimConnect.value:
+			self.dll.Close(self.hSimConnect)
+			self.hSimConnect = HANDLE()
+		self.ok = False
 
 	def map_to_sim_event(self, name):
 		for m in self.dll.EventID:
@@ -250,17 +259,14 @@ class SimConnect:
 			pObjData
 		)
 		if self.IsHR(err, 0):
-			# LOGGER.debug("Request Sent")
 			return True
 		else:
 			return False
 
 	def get_data(self, _Request):
 		self.request_data(_Request)
-		# self.run()
 		attemps = 0
 		while _Request.outData is None and attemps < _Request.attemps:
-			# self.run()
 			time.sleep(.01)
 			attemps += 1
 		if _Request.outData is None:
@@ -279,7 +285,6 @@ class SimConnect:
 		)
 
 		if self.IsHR(err, 0):
-			# LOGGER.debug("Event Sent")
 			return True
 		else:
 			return False

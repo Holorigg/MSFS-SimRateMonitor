@@ -1,420 +1,360 @@
 #!/usr/bin/env python3
+import argparse
+import ctypes
+import queue
+import sys
+import threading
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
-import threading, time, sys, os
+
+import pystray
+from PIL import Image, ImageDraw
 from loguru import logger
-from SimConnect import AircraftRequests, SimConnect
 
-# Configure loguru for detailed logging
-logger.remove()  # Remove default handler
+from app_settings import data_directory, load_settings, save_settings
+from sim_rate import SimRateWorker
+from ui_controls import SegmentedRadio, blend_colors
+from overlay_ui import RateOverlay, SIZE_CONFIGS
 
-# 只在有 stdout 时才添加控制台日志
-if sys.stdout is not None:
-    logger.add(sys.stdout, 
-              format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-              level="DEBUG")
 
-    # 总是添加文件日志
-    logger.add("msfs_mini_gui.log", 
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-            level="DEBUG", 
-            rotation="1 MB", 
-            retention=1)       # 只保留 1 个文件（旧的自动删除）
+THEME = {"bg": "#F7F7F7", "fg": "#2E2E2E", "accent": "#357C55",
+         "control_bg": "#EDEDED", "divider": "#DFDFDF"}
 
-# =============== 主题（非夜间） ===============
-THEMES = {
-    "modern_light_gray": {
-        "bg": "#F7F7F7",
-        "fg": "#2E2E2E",
-        "accent": "#357C55",
-        "control_bg": "#EDEDED",
-        "divider": "#DFDFDF",
-    },
-    "sky_blue": {
-        "bg": "#F5F9FF", "fg": "#333333", "accent": "#007ACC",
-        "control_bg": "#E0ECF8", "divider": "#D5E2EE",
-    },
-    "ivory_minimal": {
-        "bg": "#FAF9F6", "fg": "#4B4B4B", "accent": "#C27C0E",
-        "control_bg": "#EDE9E3", "divider": "#E2DDD5",
-    },
-    "mint_fresh": {
-        "bg": "#F2FFF8", "fg": "#444444", "accent": "#2BAE66",
-        "control_bg": "#DFF5E1", "divider": "#D0E8D2",
-    },
-    "morning_orange": {
-        "bg": "#FFF8F2", "fg": "#3D3D3D", "accent": "#FF6F00",
-        "control_bg": "#FFE0CC", "divider": "#FFD0B2",
-    },
-}
-CURRENT_THEME_NAME = "modern_light_gray"
-CURRENT_THEME = THEMES[CURRENT_THEME_NAME]
 
-# ---- helpers: 颜色混合，做选中/悬停底色 ----
-def _hex_to_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+def resource_path(name):
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / name
 
-def _rgb_to_hex(rgb):
-    return "#{:02X}{:02X}{:02X}".format(*rgb)
 
-def _blend(c1, c2, t=0.85):
-    r1,g1,b1 = _hex_to_rgb(c1); r2,g2,b2 = _hex_to_rgb(c2)
-    r = int(r1*(1-t) + r2*t); g = int(g1*(1-t) + g2*t); b = int(b1*(1-t) + b2*t)
-    return _rgb_to_hex((r,g,b))
-
-class SegmentedRadio(tk.Frame):
-    """更现代的分段单选控件：选中高亮、悬停变浅、支持主题色"""
-    def __init__(self, parent, variable, options, theme, command=None, min_item_width=36, **kw):
-        """
-        options: [(value, text), ...]
-        variable: tk.StringVar
-        theme: dict，使用你的 CURRENT_THEME
-        command: 回调（选项改变时）
-        """
-        super().__init__(parent, bg=theme["control_bg"], **kw)
-        self.var = variable
-        self.options = options
-        self.t = theme
-        self.command = command
-        self._labels = []
-
-        # 颜色体系（在 accent 与 control_bg 之间做混色）
-        self.sel_bg   = _blend(self.t["accent"], self.t["control_bg"], 0.82)  # 选中底
-        self.sel_fg   = self.t["accent"]                                      # 选中文本
-        self.hov_bg   = _blend(self.t["accent"], self.t["control_bg"], 0.90)  # 悬停底
-        self.nor_bg   = self.t["control_bg"]                                  # 常态底
-        self.nor_fg   = self.t["fg"]                                          # 常态文本
-        self.border   = self.t["divider"]
-
-        # 外层边框（形成胶囊容器）
-        self.container = tk.Frame(self, bg=self.t["control_bg"], highlightthickness=1,
-                                  highlightbackground=self.border, bd=0)
-        self.container.pack(fill="x")
-
-        # 生成标签项
-        cols = len(self.options)
-        for i, (value, text) in enumerate(self.options):
-            self.container.grid_columnconfigure(i, weight=1, uniform="seg")
-            cell = tk.Frame(self.container, bg=self.nor_bg)
-            cell.grid(row=0, column=i, sticky="nsew")
-
-            lbl = tk.Label(cell, text=text, bg=self.nor_bg, fg=self.nor_fg,
-                           font=("Segoe UI", 10, "bold" if self.var.get()==value else "normal"),
-                           padx=12, pady=6, cursor="hand2")
-            lbl.pack(fill="both", expand=True)
-            lbl.bind("<Button-1>", lambda e, v=value: self._on_click(v))
-            lbl.bind("<Enter>", lambda e, L=lbl: self._on_hover(L, True))
-            lbl.bind("<Leave>", lambda e, L=lbl: self._on_hover(L, False))
-
-            # 让每项最小宽度更协调
-            lbl.update_idletasks()
-            if lbl.winfo_width() < min_item_width:
-                lbl.config(width=int(min_item_width/7))
-
-            self._labels.append((value, lbl))
-
-        # 变量联动
-        self.var.trace_add("write", lambda *_: self._sync())
-        self._sync()
-
-    def _on_click(self, value):
-        if self.var.get() != value:
-            self.var.set(value)
-        if self.command:
-            self.command()
-
-    def _on_hover(self, lbl, entering):
-        value = None
-        for v, l in self._labels:
-            if l is lbl:
-                value = v
-                break
-        if value is None:
-            return
-        if self.var.get() == value:
-            # 已选中：悬停不改变（保持稳重）
-            return
-        lbl.configure(bg=self.hov_bg)
-
-        if not entering:
-            # 离开还原
-            lbl.configure(bg=self.nor_bg)
-
-    def _sync(self):
-        cur = self.var.get()
-        for v, lbl in self._labels:
-            if v == cur:
-                lbl.configure(bg=self.sel_bg, fg=self.sel_fg, font=("Segoe UI", 10, "bold"))
-            else:
-                lbl.configure(bg=self.nor_bg, fg=self.nor_fg, font=("Segoe UI", 10, "normal"))
+def configure_logging():
+    logger.remove()
+    if sys.stdout is not None:
+        logger.add(sys.stdout, level="INFO")
+    try:
+        logger.add(data_directory() / "msfs_mini_gui.log", level="DEBUG",
+                   rotation="1 MB", retention=1, encoding="utf-8")
+    except OSError:
+        pass
 
 
 class SimRateMonitor:
-    def __init__(self):
+    def __init__(self, start_minimized=False, settings_path=None,
+                 worker_factory=SimRateWorker, tray_factory=pystray.Icon):
+        self.settings_path = settings_path
+        self.settings = load_settings(settings_path)
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title("MSFS Sim Rate Monitor")
-        self.root.geometry("320x230")
         self.root.resizable(False, False)
-
+        self.root.configure(bg=THEME["bg"])
         try:
-            # PyInstaller 资源路径处理
-            if getattr(sys, 'frozen', False):
-                # 打包后的环境
-                base_path = sys._MEIPASS
-            else:
-                # 开发环境
-                base_path = os.path.dirname(os.path.abspath(__file__))
-            
-            icon_path = os.path.join(base_path, "mini_gui_icon.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-        except (tk.TclError, Exception):
+            self.root.iconbitmap(str(resource_path("mini_gui_icon.ico")))
+        except tk.TclError:
             pass
 
-        self.sim_rate = tk.StringVar(value="-- x")
-        self.overlay_size = tk.StringVar(value="hide")
-        self.sim_connect = None
-        self.aircraft_requests = None
-        self.connected = False
         self.running = True
+        self.connected = False
+        self.messages = queue.Queue()
+        self.sim_rate = tk.StringVar(value="-- x")
+        self.status = tk.StringVar(value="Waiting for MSFS 2024...")
+        self.overlay_size = tk.StringVar(value=self.settings.overlay_size)
+        self.start_minimized = tk.BooleanVar(value=self.settings.start_minimized)
         self.overlay_window = None
-
-        self.size_configs = {
-            "s": {"width": 80, "height": 25, "font_size": 10},
-            "m": {"width": 120, "height": 40, "font_size": 16},
-            "l": {"width": 160, "height": 55, "font_size": 20},
-            "xl": {"width": 200, "height": 70, "font_size": 24},
-            "xxl": {"width": 250, "height": 85, "font_size": 28},
-            "hide": None,
-        }
-
-        # 存放 tk.Radiobutton
-        self._size_radios = {}
-
+        self.tray_icon = None
+        self.tray_thread = None
+        self.tray_ready = False
+        self.tray_label = "Waiting for MSFS 2024"
+        self._launch_hidden = start_minimized or self.settings.start_minimized
+        self.worker = worker_factory(self.messages)
+        self._poll_id = None
+        self._startup_id = None
         self.setup_ui()
-        self.start_simconnect_thread()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.bind("<Unmap>", self._on_minimize, add="+")
+        self.start_tray(tray_factory)
+        self.worker.start()
+        self.on_size_change(save=False)
+        self._poll_id = self.root.after(50, self._poll_messages)
+        if self._launch_hidden:
+            self._startup_id = self.root.after(3000, self._tray_startup_timeout)
+        else:
+            self.show_window()
 
     def setup_ui(self):
-        t = CURRENT_THEME
-
-        # ttk 只负责“外围”，卡片内部改用 tk 控件保证背景完全一致
-        style = ttk.Style()
-        try: style.theme_use("clam")
-        except Exception: pass
-        style.configure("App.TFrame", background=t["bg"])
-        style.configure("App.Title.TLabel", background=t["bg"], foreground=t["accent"],
-                        font=("Segoe UI", 28, "bold"))
-
-        self.root.configure(bg=t["bg"])
-
-        # 主容器
-        main = ttk.Frame(self.root, padding=16, style="App.TFrame")
-        main.grid(row=0, column=0, sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        main = tk.Frame(self.root, bg=THEME["bg"], padx=16, pady=16)
+        main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
+        tk.Label(main, textvariable=self.sim_rate, bg=THEME["bg"], fg=THEME["accent"],
+                 font=("Segoe UI", 28, "bold")).grid(row=0, column=0, pady=(6, 2))
 
-        # 大号速率显示
-        rate_label = ttk.Label(main, textvariable=self.sim_rate, style="App.Title.TLabel")
-        rate_label.grid(row=0, column=0, pady=(6, 10), sticky="n")
+        controls = tk.Frame(main, bg=THEME["bg"])
+        controls.grid(row=1, column=0, pady=(0, 6))
+        self.rate_buttons = {}
+        for column, (command, text) in enumerate(
+                (("decrease", "−"), ("normal", "1×"), ("increase", "+"))):
+            button = tk.Button(controls, text=text, width=3, padx=8, pady=1, bd=0,
+                               relief="flat", highlightthickness=0, bg=THEME["bg"],
+                               fg=THEME["accent"], disabledforeground="#B5BCB8",
+                               activebackground=blend_colors(THEME["accent"], THEME["bg"], 0.92),
+                               activeforeground=THEME["accent"], font=("Segoe UI", 11),
+                               cursor="hand2", command=lambda action=command: self.send_command(action),
+                               state="disabled")
+            button.grid(row=0, column=column, padx=2)
+            button.bind("<Enter>", lambda event, item=button: item.configure(
+                bg=blend_colors(THEME["accent"], THEME["bg"], 0.94)
+                if str(item["state"]) == "normal" else THEME["bg"]))
+            button.bind("<Leave>", lambda event, item=button: item.configure(bg=THEME["bg"]))
+            self.rate_buttons[command] = button
 
-        # 分隔线
-        divider = tk.Frame(main, height=1, bg=t["divider"], bd=0, highlightthickness=0)
-        divider.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+        tk.Frame(main, height=1, bg=THEME["divider"]).grid(
+            row=2, column=0, sticky="ew", pady=(4, 10))
+        card = tk.Frame(main, bg=THEME["control_bg"], padx=12, pady=10)
+        card.grid(row=3, column=0, sticky="ew")
+        card.columnconfigure(0, weight=1)
+        tk.Label(card, text="Overlay Size", bg=THEME["control_bg"], fg=THEME["fg"],
+                 font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w")
+        self.options_menu = tk.Menu(self.root, tearoff=False, font=("Segoe UI", 10))
+        self.options_menu.add_checkbutton(label="Start minimized to tray", variable=self.start_minimized,
+                                          command=self._save_preferences, state="disabled")
+        self.options_menu.add_command(label="Hide to tray", command=self.hide_to_tray, state="disabled")
+        self.options_menu.add_separator()
+        self.options_menu.add_command(label="Exit", command=self.on_closing)
+        self.options_button = tk.Button(
+            card, text="⋯", bg=THEME["control_bg"], fg="#7D857F", bd=0,
+            highlightthickness=0, padx=4, pady=0, font=("Segoe UI", 12), cursor="hand2",
+            activebackground=THEME["control_bg"], activeforeground=THEME["accent"],
+            command=self._show_options)
+        self.options_button.grid(row=0, column=1, sticky="e")
+        self.size_seg = SegmentedRadio(card, self.overlay_size,
+                                       (("hide", "Hide"), ("s", "S"), ("m", "M"), ("l", "L")),
+                                       theme=THEME, command=self.on_size_change)
+        self.size_seg.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.status_label = tk.Label(main, textvariable=self.status, bg=THEME["bg"],
+                                      fg="#8B6B47", font=("Segoe UI", 9), wraplength=280,
+                                      anchor="center", justify="center")
+        self.status_label.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.status_label.grid_remove()
+        self.root.update_idletasks()
+        self.root.geometry(f"{max(320, self.root.winfo_reqwidth())}x{max(230, self.root.winfo_reqheight())}")
 
-        # 控制卡片（纯 tk，确保所有文字背景=control_bg）
-        card = tk.Frame(main, bg=t["control_bg"], bd=0, highlightthickness=0)
-        card.grid(row=2, column=0, sticky="ew")
-        card.grid_columnconfigure(0, weight=1)
-        # 内边距
-        card_pad = tk.Frame(card, bg=t["control_bg"], padx=12, pady=10)
-        card_pad.grid(row=0, column=0, sticky="ew")
+    def _show_options(self):
+        try:
+            self.options_menu.tk_popup(self.options_button.winfo_rootx(),
+                                        self.options_button.winfo_rooty() + self.options_button.winfo_height())
+        finally:
+            self.options_menu.grab_release()
 
-        # Section 标题（bg=control_bg）
-        title = tk.Label(card_pad, text="Overlay Size",
-                         bg=t["control_bg"], fg=t["fg"], font=("Segoe UI", 10))
-        title.grid(row=0, column=0, sticky="w")
+    def _show_status_error(self):
+        self.status_label.grid()
+        self.root.update_idletasks()
+        self.root.geometry(f"{max(320, self.root.winfo_reqwidth())}x{max(230, self.root.winfo_reqheight())}")
 
-        # 分段单选区域（现代风）
-        size_frame = tk.Frame(card_pad, bg=t["control_bg"])
-        size_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+    def _post_action(self, action):
+        def callback(icon, item):
+            self.messages.put(("action", action))
+        return callback
 
-        size_options = [
-            ("hide", "Hide"), ("s", "S"), ("m", "M"),
-            ("l", "L")
-        ]
-        self.size_seg = SegmentedRadio(
-            size_frame, self.overlay_size, size_options,
-            theme=t, command=self.on_size_change
-        )
-        self.size_seg.pack(fill="x")
-
-    # 选中态：粗体 + accent，未选：常规 + fg
-    def _refresh_size_radio_styles(self):
-        t = CURRENT_THEME
-        selected = self.overlay_size.get()
-        for value, rb in self._size_radios.items():
-            if value == selected:
-                rb.configure(fg=t["accent"], activeforeground=t["accent"],
-                             font=("Segoe UI", 10, "bold"))
-            else:
-                rb.configure(fg=t["fg"], activeforeground=t["fg"],
-                             font=("Segoe UI", 10))
-
-    # ===== SimConnect 线程逻辑保持不变 =====
-    def start_simconnect_thread(self):
-        self.simconnect_thread = threading.Thread(target=self.simconnect_worker, daemon=True)
-        self.simconnect_thread.start()
-
-    def simconnect_worker(self):
-        logger.info("Starting SimConnect worker thread")
-        while self.running:
+    def start_tray(self, factory):
+        try:
             try:
-                if not self.connected:
-                    self.connect_to_msfs()
-                    if not self.connected:
-                        logger.debug("Connection failed, waiting 3 seconds before retry...")
-                    time.sleep(3.0)
+                with Image.open(resource_path("mini_gui_icon.ico")) as source:
+                    image = source.convert("RGBA")
+            except OSError:
+                image = Image.new("RGBA", (64, 64), THEME["accent"])
+                ImageDraw.Draw(image).text((18, 22), "1x", fill="white")
+            enabled = lambda item: self.worker.controls_available
+            menu = pystray.Menu(
+                pystray.MenuItem("Show monitor", self._post_action("show"), default=True),
+                pystray.MenuItem(lambda item: self.tray_label, None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Increase speed (+)", self._post_action("increase"), enabled=enabled),
+                pystray.MenuItem("Decrease speed (−)", self._post_action("decrease"), enabled=enabled),
+                pystray.MenuItem("Normal speed (1×)", self._post_action("normal"), enabled=enabled),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Exit", self._post_action("exit")),
+            )
+            self.tray_icon = factory("MSFS-SimRateMonitor", image,
+                                     "MSFS Sim Rate Monitor", menu)
+
+            def ready(icon):
+                try:
+                    if not self.running:
+                        icon.stop()
+                        return
+                    icon.visible = True
+                    self.messages.put(("tray_ready", None))
+                except Exception as error:
+                    self.messages.put(("tray_failed", str(error)))
+
+            def run_tray():
+                try:
+                    self.tray_icon.run(setup=ready)
+                except Exception as error:
+                    self.messages.put(("tray_failed", str(error)))
+                finally:
+                    self.messages.put(("tray_stopped", None))
+
+            self.tray_thread = threading.Thread(target=run_tray, name="System tray", daemon=True)
+            self.tray_thread.start()
+        except Exception as error:
+            self.messages.put(("tray_failed", str(error)))
+
+    def _poll_messages(self):
+        if not self.running:
+            return
+        for _ in range(100):
+            try:
+                kind, value = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "action":
+                if value == "show":
+                    self.show_window()
+                elif value == "exit":
+                    self.on_closing()
+                    return
                 else:
-                    self.update_sim_rate()
-                    time.sleep(0.5)
-            except Exception as e:
-                logger.error(f"SimConnect worker thread error: {type(e).__name__}: {e}")
-                self.handle_disconnect()
-                time.sleep(3.0)
-        logger.info("SimConnect worker thread stopped")
+                    self.send_command(value)
+            elif kind == "tray_ready":
+                self.tray_ready = True
+                self.options_menu.entryconfigure(0, state="normal")
+                self.options_menu.entryconfigure(1, state="normal")
+                if self._launch_hidden:
+                    self.hide_to_tray()
+                self._launch_hidden = False
+            elif kind in ("tray_failed", "tray_stopped"):
+                self._handle_tray_failure(value)
+            elif kind == "connected":
+                self.connected = True
+                self.status.set("Connected to MSFS 2024")
+                self.status_label.grid_remove()
+                self._set_controls(True)
+            elif kind == "disconnected":
+                self.connected = False
+                self.status.set("Waiting for MSFS 2024...")
+                self.status_label.grid_remove()
+                self._set_controls(False)
+                self._update_rate("-- x")
+            elif kind == "rate":
+                self._update_rate(f"{value:.2f}×")
+            elif kind == "resetting":
+                self.status.set("Returning to 1×...")
+                self.status_label.grid_remove()
+                self._set_controls(False)
+            elif kind == "reset_done":
+                self.status.set("Connected to MSFS 2024")
+                self.status_label.grid_remove()
+                self._set_controls(True)
+            elif kind == "error":
+                self.status.set(value)
+                self._show_status_error()
+                self._set_controls(self.worker.controls_available)
+        self._poll_id = self.root.after(50, self._poll_messages)
 
-    def connect_to_msfs(self):
-        logger.info("Attempting to connect to MSFS...")
+    def _set_controls(self, enabled):
+        for button in self.rate_buttons.values():
+            button.configure(state="normal" if enabled else "disabled")
+        self._update_tray()
+
+    def send_command(self, command):
+        if not self.worker.submit(command):
+            if not self.connected:
+                self.status.set("Waiting for MSFS 2024...")
+            return False
+        return True
+
+    def _update_rate(self, text):
+        self.sim_rate.set(text)
+        if self.overlay_window:
+            self.overlay_window.set_rate(text)
+        label = f"Simulation rate: {text}" if self.connected else "Waiting for MSFS 2024"
+        if label != self.tray_label:
+            self.tray_label = label
+            self._update_tray()
+
+    def _update_tray(self):
+        if self.tray_ready:
+            try:
+                self.tray_icon.title = f"MSFS Sim Rate Monitor | {self.tray_label}"
+                self.tray_icon.update_menu()
+            except Exception as error:
+                self._handle_tray_failure(str(error))
+
+    def _handle_tray_failure(self, error):
+        if error:
+            logger.warning("System tray unavailable: {}", error)
+        self.tray_ready = False
+        self._launch_hidden = False
+        self.options_menu.entryconfigure(0, state="disabled")
+        self.options_menu.entryconfigure(1, state="disabled")
+        self.show_window()
+
+    def _tray_startup_timeout(self):
+        self._startup_id = None
+        if self.running and not self.tray_ready:
+            self._handle_tray_failure("Icon did not become ready in time")
+
+    def show_window(self):
+        if not self.running:
+            return
+        self._launch_hidden = False
+        self.root.deiconify()
+        self.root.lift()
+
+    def hide_to_tray(self):
+        if self.tray_ready:
+            self.root.withdraw()
+
+    def _on_minimize(self, event):
+        if event.widget == self.root and self.running and self.root.state() == "iconic":
+            self.hide_to_tray()
+
+    def _save_preferences(self):
+        self.settings.start_minimized = self.start_minimized.get()
+        self.settings.overlay_size = self.overlay_size.get()
         try:
-            # Clean up existing connections
-            if self.aircraft_requests:
-                logger.debug("Cleaning up existing AircraftRequests instance")
-                self.aircraft_requests = None
-            if self.sim_connect:
-                logger.debug("Cleaning up existing SimConnect instance")
-                try: 
-                    self.sim_connect.exit()
-                except Exception as e: 
-                    logger.debug(f"Error cleaning up existing SimConnect: {e}")
-                self.sim_connect = None
+            save_settings(self.settings, self.settings_path)
+        except OSError as error:
+            logger.warning("Cannot save settings: {}", error)
+            self.status.set("Could not save preferences. Check the log file.")
+            self._show_status_error()
 
-            logger.debug("Creating new SimConnect instance")
-            self.sim_connect = SimConnect(auto_connect=False)
-            
-            logger.debug("Calling SimConnect.connect()")
-            self.sim_connect.connect()
-            logger.debug("SimConnect.connect() completed successfully")
+    def on_size_change(self, save=True):
+        self.destroy_overlay()
+        size = self.overlay_size.get()
+        if size in SIZE_CONFIGS:
+            self.overlay_window = RateOverlay(
+                self.root, size, self.sim_rate.get(), self.start_move, self.do_move,
+                lambda event: self._save_preferences())
+            self.overlay_window.update_idletasks()
+            self._position_overlay(self.settings.overlay_x, self.settings.overlay_y)
+            self.overlay_window.deiconify()
+        if save:
+            self._save_preferences()
 
-            logger.debug("Creating AircraftRequests instance with SimConnect")
-            self.aircraft_requests = AircraftRequests(self.sim_connect)
-            logger.debug("AircraftRequests instance created successfully")
-            
-            # Test the connection by trying to get simulation rate
-            logger.debug("Testing connection by requesting simulation rate")
-            test_rate = self.aircraft_requests.get("SIMULATION_RATE")
-            logger.debug(f"Test request result: {test_rate}")
-            
-            self.connected = True
-            logger.success("✅ Successfully connected to MSFS via AircraftRequests")
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to MSFS: {type(e).__name__}: {e}")
-            logger.debug(f"Connection error details:", exc_info=True)
-            self.handle_disconnect()
-
-    def update_sim_rate(self):
-        try:
-            if not self.aircraft_requests:
-                self.handle_disconnect(); return
-            
-            rate = self.aircraft_requests.get("SIMULATION_RATE")
-            if rate is not None and isinstance(rate, (int, float)) and rate >= 0:
-                rate_text = f"{rate:.2f}x"
-                
-                # 使用 after_idle 而不是 after(0) 来提高响应性
-                self.root.after_idle(lambda: self._update_ui_rate(rate_text))
-        except Exception as e:
-            logger.debug(f"Update sim rate error: {e}")
-            self.handle_disconnect()
-    
-    def _update_ui_rate(self, rate_text):
-        """在主线程中更新UI"""
-        try:
-            self.sim_rate.set(rate_text)
-            if self.overlay_window and self.overlay_size.get() != "hide":
-                self.update_overlay(rate_text)
-        except Exception as e:
-            logger.debug(f"UI update error: {e}")
-
-    def handle_disconnect(self):
-        logger.warning("Handling MSFS disconnection")
-        self.connected = False
-        if self.aircraft_requests:
-            self.aircraft_requests = None
-        if self.sim_connect:
-            try: 
-                self.sim_connect.exit()
-                logger.debug("SimConnect instance cleaned up")
-            except Exception as e:
-                logger.debug(f"Error during SimConnect cleanup: {e}")
-            self.sim_connect = None
-        self.root.after(0, lambda: self.sim_rate.set("-- x"))
-        if self.overlay_window and self.overlay_size.get() != "hide":
-            self.root.after(0, lambda: self.update_overlay("-- x"))
-
-    def on_size_change(self):
-        self._refresh_size_radio_styles()
-        selected_size = self.overlay_size.get()
-        if selected_size == "hide":
-            self.destroy_overlay()
-        else:
-            if self.overlay_window:
-                self.destroy_overlay()
-            self.create_overlay()
-            current_rate = self.sim_rate.get()
-            if current_rate != "-- x":
-                self.update_overlay(current_rate)
-
-    # ===== Overlay（保持原样） =====
-    def create_overlay(self):
-        if self.overlay_window or self.overlay_size.get() == "hide": return
-        size_config = self.size_configs[self.overlay_size.get()]
-        if size_config is None: return
-        width, height, font_size = size_config["width"], size_config["height"], size_config["font_size"]
-
-        self.overlay_window = tk.Toplevel()
-        self.overlay_window.title("")
-        self.overlay_window.geometry(f"{width}x{height}+50+50")
-        self.overlay_window.resizable(False, False)
-        self.overlay_window.configure(bg="black")
-        self.overlay_window.overrideredirect(True)
-        self.overlay_window.wm_attributes("-topmost", True)
-        self.overlay_window.wm_attributes("-alpha", 0.8)
-
-        self.overlay_label = tk.Label(self.overlay_window, text="-- x",
-                                      font=("Arial", font_size, "bold"),
-                                      fg="lime", bg="black")
-        self.overlay_label.pack(expand=True, fill="both")
-        self.overlay_label.bind("<Button-1>", self.start_move)
-        self.overlay_label.bind("<B1-Motion>", self.do_move)
+    def _position_overlay(self, x, y):
+        # Native positioning preserves coordinates on monitors left of the
+        # primary screen. Tk's negative geometry means a right-edge offset.
+        user32 = ctypes.windll.user32
+        left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+        width, height = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+        overlay_width, overlay_height, _ = SIZE_CONFIGS[self.overlay_size.get()]
+        x = max(left, min(x, left + width - overlay_width))
+        y = max(top, min(y, top + height - overlay_height))
+        from ctypes import wintypes
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        window = user32.GetAncestor(self.overlay_window.winfo_id(), 2)
+        user32.SetWindowPos(window, None, x, y, 0, 0, 0x0015)
+        self.settings.overlay_x, self.settings.overlay_y = x, y
 
     def start_move(self, event):
-        self.x, self.y = event.x, event.y
+        self._drag_x, self._drag_y = event.x, event.y
 
     def do_move(self, event):
-        x = self.overlay_window.winfo_x() + (event.x - self.x)
-        y = self.overlay_window.winfo_y() + (event.y - self.y)
-        self.overlay_window.geometry(f"+{x}+{y}")
-
-    def update_overlay(self, rate_text):
-        try:
-            if self.overlay_window and hasattr(self, "overlay_label"):
-                self.overlay_label.config(text=rate_text)
-        except Exception as e:
-            logger.debug(f"Error updating overlay: {e}")
-            if self.overlay_size.get() != "hide":
-                self.create_overlay()
+        self._position_overlay(event.x_root - self._drag_x, event.y_root - self._drag_y)
 
     def destroy_overlay(self):
         if self.overlay_window:
@@ -422,31 +362,33 @@ class SimRateMonitor:
             self.overlay_window = None
 
     def on_closing(self):
+        if not self.running:
+            return
+        self._save_preferences()
         self.running = False
-        
-        # 关闭连接
-        if self.aircraft_requests:
-            self.aircraft_requests = None
-        if self.sim_connect:
-            try:
-                self.sim_connect.exit()
-            except: pass
-            self.sim_connect = None
-        
-        try: self.destroy_overlay()
-        except: pass
-        
-        # 快速退出，不等待线程
-        self.root.quit()
+        self.worker.stop()
+        for callback_id in (self._poll_id, self._startup_id):
+            if callback_id:
+                self.root.after_cancel(callback_id)
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.destroy_overlay()
         self.root.destroy()
 
     def run(self):
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
+        self.worker.join(timeout=2)
+        if self.tray_thread:
+            self.tray_thread.join(timeout=2)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MSFS Sim Rate Monitor")
+    parser.add_argument("--minimized", action="store_true", help="Start in the system tray")
+    args = parser.parse_args()
+    configure_logging()
+    SimRateMonitor(start_minimized=args.minimized).run()
 
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting MSFS Simulation Rate Monitor")
-    logger.info("📋 Check console and 'msfs_mini_gui.log' for detailed connection logs")
-    app = SimRateMonitor()
-    app.run()
+    main()
